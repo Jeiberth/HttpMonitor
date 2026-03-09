@@ -1,15 +1,45 @@
 #define NOMINMAX
 
+#include <pcapplusplus/Packet.h>
 #include <pcapplusplus/PcapLiveDevice.h>
 #include <pcapplusplus/PcapLiveDeviceList.h>
 
+#include <atomic>
+#include <chrono>
+#include <csignal>
 #include <iomanip>
 #include <iostream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 using namespace std;
+
+atomic<bool> gRunning{ true };
+
+void signalHandler(int)
+{
+    gRunning = false;
+}
+
+namespace metrics
+{
+    // Thread-safe metric aggregator that tracks total captured traffic.
+    class HttpMetrics
+    {
+    public:
+        void recordRequest()
+        {
+            total.fetch_add(1, memory_order_relaxed);
+        }
+
+        uint64_t getTotal() const { return total.load(); }
+
+    private:
+        atomic<uint64_t> total{ 0 };
+    };
+}
 
 namespace ui
 {
@@ -74,6 +104,51 @@ namespace ui
     }
 }
 
+namespace capture
+{
+    // RAII wrapper for PcapLiveDevice to configure and manage the packet capture lifecycle.
+    class Engine
+    {
+    public:
+        explicit Engine(pcpp::PcapLiveDevice* dev)
+            : dev(dev)
+        {
+            if (!dev || !dev->open())
+                throw runtime_error("Could not open device.");
+        }
+
+        ~Engine()
+        {
+            stop();
+            if (dev)
+                dev->close();
+        }
+
+        void start(metrics::HttpMetrics& m)
+        {
+            pcpp::PortFilter filter(80, pcpp::SRC_OR_DST);
+            dev->setFilter(filter);
+
+            dev->startCapture(
+                [](pcpp::RawPacket*, pcpp::PcapLiveDevice*, void* ctx)
+                {
+                    auto* metrics = static_cast<metrics::HttpMetrics*>(ctx);
+                    metrics->recordRequest(); // Temporary basic counting
+                },
+                &m);
+        }
+
+        void stop()
+        {
+            if (dev)
+                dev->stopCapture();
+        }
+
+    private:
+        pcpp::PcapLiveDevice* dev;
+    };
+}
+
 struct Args
 {
     int duration;
@@ -96,6 +171,8 @@ Args parseArgs(int argc, char* argv[])
 
 int main(int argc, char* argv[])
 {
+    signal(SIGINT, signalHandler);
+
     try
     {
         Args args = parseArgs(argc, argv);
@@ -104,7 +181,25 @@ int main(int argc, char* argv[])
         if (!dev)
             return 0;
 
-        cout << "\nSelected: " << dev->getDesc() << " for " << args.duration << " seconds.\n";
+        metrics::HttpMetrics metrics;
+        capture::Engine engine(dev);
+
+        cout << "\nCapture started on: " << dev->getDesc() << "\n";
+        cout << "Running for " << args.duration << " seconds\n";
+
+        engine.start(metrics);
+
+        auto start = chrono::steady_clock::now();
+        while (gRunning &&
+            chrono::steady_clock::now() - start <
+            chrono::seconds(args.duration))
+        {
+            this_thread::sleep_for(chrono::milliseconds(250));
+        }
+
+        engine.stop();
+
+        cout << "\nTotal packets matching filter: " << metrics.getTotal() << "\n";
     }
     catch (const exception& e)
     {
