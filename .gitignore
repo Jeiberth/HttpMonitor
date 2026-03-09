@@ -1,0 +1,11 @@
+# Visual Studio
+.vs/
+*.vcxproj.user
+*.VC.db
+*.opendb
+
+# Build folders
+build/
+x64/
+Debug/
+Release/
