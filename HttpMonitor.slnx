@@ -3,5 +3,5 @@
     <Platform Name="x64" />
     <Platform Name="x86" />
   </Configurations>
-  <Project Path="HttpMonitor/HttpMonitor.vcxproj" />
+  <Project Path="HttpMonitor/HttpMonitor.vcxproj" Id="a49b5cce-40cc-4e54-9540-e01c76e6447f" />
 </Solution>

@@ -1,17 +1,21 @@
 #define NOMINMAX
 
+#include <pcapplusplus/HttpLayer.h>
 #include <pcapplusplus/Packet.h>
 #include <pcapplusplus/PcapLiveDevice.h>
 #include <pcapplusplus/PcapLiveDeviceList.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 using namespace std;
@@ -25,19 +29,56 @@ void signalHandler(int)
 
 namespace metrics
 {
-    // Thread-safe metric aggregator that tracks total captured traffic.
+    struct Snapshot
+    {
+        uint64_t total;
+        uint64_t dropped;
+        vector<pair<string, int>> ranked;
+    };
+
+    // Thread-safe metric aggregator that tracks HTTP requests and drops.
     class HttpMetrics
     {
     public:
-        void recordRequest()
+        void recordRequest(string_view host)
         {
             total.fetch_add(1, memory_order_relaxed);
+
+            lock_guard lock(mutex);
+
+            string key(host);
+
+            auto it = hosts.find(key);
+            if (it != hosts.end())
+                it->second++;
+            else
+                hosts.emplace(move(key), 1);
         }
 
-        uint64_t getTotal() const { return total.load(); }
+        void recordDrop()
+        {
+            dropped.fetch_add(1, memory_order_relaxed);
+        }
+
+        Snapshot snapshot()
+        {
+            lock_guard lock(mutex);
+
+            vector<pair<string, int>> ranked(hosts.begin(), hosts.end());
+
+            sort(ranked.begin(), ranked.end(),
+                [](auto& a, auto& b)
+                { return a.second > b.second; });
+
+            return { total.load(), dropped.load(), move(ranked) };
+        }
 
     private:
         atomic<uint64_t> total{ 0 };
+        atomic<uint64_t> dropped{ 0 };
+
+        unordered_map<string, int> hosts;
+        mutex mutex;
     };
 }
 
@@ -102,6 +143,40 @@ namespace ui
             }
         }
     }
+
+    // Formats and prints a summarized report of captured HTTP metrics to standard output.
+    void renderReport(const metrics::Snapshot& snap)
+    {
+        cout << "\n\n"
+            << string(50, '=') << "\n";
+        cout << "HTTP MONITOR SUMMARY\n";
+        cout << string(50, '=') << "\n";
+
+        cout << "Total HTTP Requests: " << snap.total << "\n";
+
+        if (snap.dropped)
+            cout << "Parse Errors: " << snap.dropped << "\n";
+
+        cout << "\n"
+            << left << setw(30) << "HOST"
+            << "COUNT\n";
+
+        cout << string(45, '-') << "\n";
+
+        size_t limit = min<size_t>(10, snap.ranked.size());
+
+        for (size_t i = 0; i < limit; ++i)
+        {
+            const auto& [host, count] = snap.ranked[i];
+
+            cout << left << setw(25) << truncate(host, 23)
+                << setw(6) << count
+                << string(count, '*')
+                << "\n";
+        }
+
+        cout << string(50, '=') << "\n";
+    }
 }
 
 namespace capture
@@ -130,10 +205,25 @@ namespace capture
             dev->setFilter(filter);
 
             dev->startCapture(
-                [](pcpp::RawPacket*, pcpp::PcapLiveDevice*, void* ctx)
+                [](pcpp::RawPacket* pkt, pcpp::PcapLiveDevice*, void* ctx)
                 {
                     auto* metrics = static_cast<metrics::HttpMetrics*>(ctx);
-                    metrics->recordRequest(); // Temporary basic counting
+
+                    pcpp::Packet parsed(pkt);
+
+                    auto* http =
+                        parsed.getLayerOfType<pcpp::HttpRequestLayer>();
+
+                    if (!http)
+                        return;
+
+                    auto* host =
+                        http->getFieldByName(PCPP_HTTP_HOST_FIELD);
+
+                    if (host)
+                        metrics->recordRequest(host->getFieldValue());
+                    else
+                        metrics->recordRequest("unknown");
                 },
                 &m);
         }
@@ -176,20 +266,27 @@ int main(int argc, char* argv[])
     try
     {
         Args args = parseArgs(argc, argv);
+
         auto* dev = ui::selectInterface();
 
         if (!dev)
             return 0;
 
         metrics::HttpMetrics metrics;
+
         capture::Engine engine(dev);
 
-        cout << "\nCapture started on: " << dev->getDesc() << "\n";
-        cout << "Running for " << args.duration << " seconds\n";
+        cout << "\nCapture started on: "
+            << dev->getDesc() << "\n";
+
+        cout << "Running for "
+            << args.duration
+            << " seconds\n";
 
         engine.start(metrics);
 
         auto start = chrono::steady_clock::now();
+
         while (gRunning &&
             chrono::steady_clock::now() - start <
             chrono::seconds(args.duration))
@@ -199,7 +296,7 @@ int main(int argc, char* argv[])
 
         engine.stop();
 
-        cout << "\nTotal packets matching filter: " << metrics.getTotal() << "\n";
+        ui::renderReport(metrics.snapshot());
     }
     catch (const exception& e)
     {
