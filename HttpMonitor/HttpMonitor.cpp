@@ -9,9 +9,11 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -37,9 +39,18 @@ namespace metrics
     };
 
     // Thread-safe metric aggregator that tracks HTTP requests and drops.
+    // Can optionally stream discovered hosts to a log file.
     class HttpMetrics
     {
     public:
+        explicit HttpMetrics(optional<string> logPath)
+        {
+            if (logPath)
+            {
+                logFile.open(*logPath);
+            }
+        }
+
         void recordRequest(string_view host)
         {
             total.fetch_add(1, memory_order_relaxed);
@@ -53,6 +64,9 @@ namespace metrics
                 it->second++;
             else
                 hosts.emplace(move(key), 1);
+
+            if (logFile.is_open())
+                logFile << host << "\n";
         }
 
         void recordDrop()
@@ -79,11 +93,15 @@ namespace metrics
 
         unordered_map<string, int> hosts;
         mutex mutex;
+
+        ofstream logFile;
     };
+
 }
 
 namespace ui
 {
+
     string truncate(string_view s, size_t len)
     {
         if (s.size() <= len)
@@ -177,10 +195,12 @@ namespace ui
 
         cout << string(50, '=') << "\n";
     }
+
 }
 
 namespace capture
 {
+
     // RAII wrapper for PcapLiveDevice to configure and manage the packet capture lifecycle.
     class Engine
     {
@@ -237,21 +257,36 @@ namespace capture
     private:
         pcpp::PcapLiveDevice* dev;
     };
+
 }
 
 struct Args
 {
     int duration;
+    optional<string> logPath;
 };
 
-// Parses command-line arguments to extract capture duration.
+// Parses command-line arguments to extract capture duration and an optional log path.
 Args parseArgs(int argc, char* argv[])
 {
     if (argc < 2)
-        throw runtime_error("Usage: httpmon <seconds>");
+        throw runtime_error("Usage: httpmon [/L:logfile] <seconds>");
 
     Args args{};
-    args.duration = stoi(argv[1]);
+
+    for (int i = 1; i < argc; ++i)
+    {
+        string arg = argv[i];
+
+        if (arg.rfind("/L:", 0) == 0)
+        {
+            args.logPath = arg.substr(3);
+        }
+        else
+        {
+            args.duration = stoi(arg);
+        }
+    }
 
     if (args.duration <= 0)
         throw runtime_error("Duration must be positive.");
@@ -272,7 +307,7 @@ int main(int argc, char* argv[])
         if (!dev)
             return 0;
 
-        metrics::HttpMetrics metrics;
+        metrics::HttpMetrics metrics(args.logPath);
 
         capture::Engine engine(dev);
 
